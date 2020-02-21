@@ -4,7 +4,6 @@ using System.Linq;
 using System.Text.Encodings.Web;
 using System.Text.Unicode;
 using Microsoft.ApplicationInsights.Extensibility.Implementation;
-using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -16,12 +15,17 @@ using Microsoft.AspNetCore.Rewrite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 using Microsoft.Extensions.WebEncoders;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Serialization;
+using StackExchange.Redis;
 using Swashbuckle.AspNetCore.Swagger;
+using Swashbuckle.AspNetCore.SwaggerGen;
 using VirtoCommerce.LiquidThemeEngine;
 using VirtoCommerce.Storefront.Binders;
 using VirtoCommerce.Storefront.Caching;
+using VirtoCommerce.Storefront.Caching.Redis;
 using VirtoCommerce.Storefront.DependencyInjection;
 using VirtoCommerce.Storefront.Domain;
 using VirtoCommerce.Storefront.Domain.Cart;
@@ -55,6 +59,7 @@ using VirtoCommerce.Storefront.Model.Subscriptions.Services;
 using VirtoCommerce.Storefront.Model.Tax.Services;
 using VirtoCommerce.Storefront.Routing;
 using VirtoCommerce.Tools;
+using SameSiteMode = Microsoft.AspNetCore.Http.SameSiteMode;
 
 namespace VirtoCommerce.Storefront
 {
@@ -96,10 +101,12 @@ namespace VirtoCommerce.Storefront
             services.AddSingleton<IPricingService, PricingService>();
             services.AddSingleton<ITaxEvaluator, TaxEvaluator>();
             services.AddSingleton<IPromotionEvaluator, PromotionEvaluator>();
+            services.AddSingleton<IDynamicContentEvaluator, DynamicContentEvaluator>();
             services.AddSingleton<IMarketingService, MarketingService>();
             services.AddSingleton<IStaticContentService, StaticContentService>();
             services.AddSingleton<IMenuLinkListService, MenuLinkListServiceImpl>();
             services.AddSingleton<IStaticContentItemFactory, StaticContentItemFactory>();
+            services.AddSingleton<IStaticContentLoaderFactory, StaticContentLoaderFactory>();
             services.AddSingleton<IApiChangesWatcher, ApiChangesWatcher>();
             services.AddSingleton<AssociationRecommendationsProvider>();
             services.AddSingleton<CognitiveRecommendationsProvider>();
@@ -109,6 +116,7 @@ namespace VirtoCommerce.Storefront
             services.AddTransient<ICartBuilder, CartBuilder>();
             services.AddTransient<ICartService, CartService>();
             services.AddTransient<AngularAntiforgeryCookieResultFilter>();
+            services.AddTransient<AnonymousUserForStoreAuthorizationFilter>();
 
             //Register events framework dependencies
             services.AddSingleton(new InProcessBus());
@@ -116,13 +124,26 @@ namespace VirtoCommerce.Storefront
             services.AddSingleton<IHandlerRegistrar>(provider => provider.GetService<InProcessBus>());
 
             //Cache
-            services.AddSingleton<IStorefrontMemoryCache, StorefrontMemoryCache>();
+            var redisConnectionString = Configuration.GetConnectionString("RedisConnectionString");
+            if (!string.IsNullOrEmpty(redisConnectionString))
+            {
+                services.AddOptions<RedisCachingOptions>().Bind(Configuration.GetSection("VirtoCommerce:Redis")).ValidateDataAnnotations();
+
+                var redis = ConnectionMultiplexer.Connect(redisConnectionString);
+                services.AddSingleton(redis.GetSubscriber());
+                services.AddSingleton<IStorefrontMemoryCache, RedisStorefrontMemoryCache>();
+            }
+            else
+            {
+                services.AddSingleton<IStorefrontMemoryCache, StorefrontMemoryCache>();
+            }
 
             //Register platform API clients
             services.AddPlatformEndpoint(options =>
             {
                 Configuration.GetSection("VirtoCommerce:Endpoint").Bind(options);
             });
+
 
             services.AddSingleton<ICountriesService, FileSystemCountriesService>();
             services.Configure<FileSystemCountriesOptions>(options =>
@@ -164,11 +185,13 @@ namespace VirtoCommerce.Storefront
             services.AddSingleton<IAuthorizationHandler, CanImpersonateAuthorizationHandler>();
             services.AddSingleton<IAuthorizationHandler, CanReadContentItemAuthorizationHandler>();
             services.AddSingleton<IAuthorizationHandler, OnlyRegisteredUserAuthorizationHandler>();
+            services.AddSingleton<IAuthorizationHandler, AnonymousUserForStoreAuthorizationHandler>();
             // register the AuthorizationPolicyProvider which dynamically registers authorization policies for each permission defined in the platform 
             services.AddSingleton<IAuthorizationPolicyProvider, PermissionAuthorizationPolicyProvider>();
             //Storefront authorization handler for policy based on permissions 
             services.AddSingleton<IAuthorizationHandler, PermissionAuthorizationHandler>();
             services.AddSingleton<IAuthorizationHandler, CanEditOrganizationResourceAuthorizationHandler>();
+            services.AddSingleton<IAuthorizationHandler, CanAccessOrderAuthorizationHandler>();
             services.AddAuthorization(options =>
             {
                 options.AddPolicy(CanImpersonateAuthorizationRequirement.PolicyName,
@@ -179,8 +202,11 @@ namespace VirtoCommerce.Storefront
                                 policy => policy.Requirements.Add(new CanEditOrganizationResourceAuthorizeRequirement()));
                 options.AddPolicy(OnlyRegisteredUserAuthorizationRequirement.PolicyName,
                                 policy => policy.Requirements.Add(new OnlyRegisteredUserAuthorizationRequirement()));
+                options.AddPolicy(AnonymousUserForStoreAuthorizationRequirement.PolicyName,
+                                policy => policy.Requirements.Add(new AnonymousUserForStoreAuthorizationRequirement()));
+                options.AddPolicy(CanAccessOrderAuthorizationRequirement.PolicyName,
+                              policy => policy.Requirements.Add(new CanAccessOrderAuthorizationRequirement()));
             });
-
 
             var auth = services.AddAuthentication();
 
@@ -217,12 +243,18 @@ namespace VirtoCommerce.Storefront
                 });
             }
 
-            //This line is required in order to use the old Identity V2 hashes to prevent rehashes passwords for platform users which login in the storefront
-            //and it can lead to platform access denied for them. (TODO: Need to remove after platform migration to .NET Core)
+            // This line is required in order to use the old Identity V2 hashes to prevent rehashes passwords for platform users which login in the storefront
+            // and it can lead to platform access denied for them. (TODO: Need to remove after platform migration to .NET Core)
             services.Configure<PasswordHasherOptions>(option => option.CompatibilityMode = PasswordHasherCompatibilityMode.IdentityV2);
             services.Configure<IdentityOptions>(Configuration.GetSection("IdentityOptions"));
-            services.Configure<CookieAuthenticationOptions>(IdentityConstants.ApplicationScheme, Configuration.GetSection("CookieAuthenticationOptions"));
             services.AddIdentity<User, Role>(options => { }).AddDefaultTokenProviders();
+
+            services.AddScoped<CustomCookieAuthenticationEvents>();
+            services.ConfigureApplicationCookie(options =>
+            {
+                Configuration.GetSection("CookieAuthenticationOptions").Bind(options);
+                options.EventsType = typeof(CustomCookieAuthenticationEvents);
+            });
 
             services.Configure<CookiePolicyOptions>(options =>
             {
@@ -236,65 +268,72 @@ namespace VirtoCommerce.Storefront
             {
                 options.Cookie.IsEssential = true;
             });
-
-            services.Replace(ServiceDescriptor.Transient<CookieAuthenticationHandler, CustomCookieAuthenticationHandler>());
-
-            //Add Liquid view engine
+            // Add Liquid view engine
             services.AddLiquidViewEngine(options =>
             {
                 Configuration.GetSection("VirtoCommerce:LiquidThemeEngine").Bind(options);
             });
 
-            var snapshotProvider = services.BuildServiceProvider();
-            services.AddAntiforgery(options => options.HeaderName = "X-XSRF-TOKEN");
+            services.AddAntiforgery(options =>
+            {
+                options.HeaderName = "X-XSRF-TOKEN";
+                options.SuppressXFrameOptionsHeader = true;
+            });
             services.AddMvc(options =>
             {
-                //Workaround to avoid 'Null effective policy causing exception' (on logout)
-                //https://github.com/aspnet/Mvc/issues/7809
-                //TODO: Try to remove in ASP.NET Core 2.2
+                // Workaround to avoid 'Null effective policy causing exception' (on logout)
+                // https://github.com/aspnet/Mvc/issues/7809
+                // TODO: Try to remove in ASP.NET Core 2.2
                 options.AllowCombiningAuthorizeFilters = false;
 
+                // Thus we disable anonymous users based on "Store:AllowAnonymous" store option
+                options.Filters.AddService<AnonymousUserForStoreAuthorizationFilter>();
 
                 options.CacheProfiles.Add("Default", new CacheProfile()
                 {
                     Duration = (int)TimeSpan.FromHours(1).TotalSeconds,
                     VaryByHeader = "host"
                 });
+                options.CacheProfiles.Add("None", new CacheProfile()
+                {
+                    NoStore = true,
+                    Location = ResponseCacheLocation.None
+                });
 
                 options.Filters.AddService(typeof(AngularAntiforgeryCookieResultFilter));
 
                 // To include only Api controllers to swagger document
                 options.Conventions.Add(new ApiExplorerApiControllersConvention());
+
+                // Use the routing logic of ASP.NET Core 2.1 or earlier:
+                options.EnableEndpointRouting = false;
             }).AddJsonOptions(options =>
             {
+                options.SerializerSettings.ContractResolver = new DefaultContractResolver()
+                {
+                    NamingStrategy = new CamelCaseNamingStrategy()
+                };
                 options.SerializerSettings.DefaultValueHandling = DefaultValueHandling.Include;
                 options.SerializerSettings.NullValueHandling = NullValueHandling.Ignore;
                 options.SerializerSettings.ReferenceLoopHandling = ReferenceLoopHandling.Ignore;
                 options.SerializerSettings.MissingMemberHandling = MissingMemberHandling.Ignore;
-                options.SerializerSettings.Converters.Add(new CartTypesJsonConverter(snapshotProvider.GetService<IWorkContextAccessor>()));
-                options.SerializerSettings.Converters.Add(new MoneyJsonConverter(snapshotProvider.GetService<IWorkContextAccessor>()));
-                options.SerializerSettings.Converters.Add(new CurrencyJsonConverter(snapshotProvider.GetService<IWorkContextAccessor>()));
-                options.SerializerSettings.Converters.Add(new OrderTypesJsonConverter(snapshotProvider.GetService<IWorkContextAccessor>()));
-                options.SerializerSettings.Converters.Add(new RecommendationJsonConverter(snapshotProvider.GetService<IRecommendationProviderFactory>()));
-                //Converter for providing back compatibility with old themes was used CustomerInfo type which has contained user and contact data in the single type.
-                //May be removed when all themes will fixed to new User type with nested Contact property.
+                // Force serialize MutablePagedList type as array, instead of dictionary
+                options.SerializerSettings.Converters.Add(new MutablePagedListAsArrayJsonConverter(options.SerializerSettings));
+                // Converter for providing back compatibility with old themes was used CustomerInfo type which has contained user and contact data in the single type.
+                // May be removed when all themes will fixed to new User type with nested Contact property.
                 options.SerializerSettings.Converters.Add(new UserBackwardCompatibilityJsonConverter(options.SerializerSettings));
-            }).AddViewOptions(options =>
-            {
-                options.ViewEngines.Add(snapshotProvider.GetService<ILiquidViewEngine>());
-            })
-            .SetCompatibilityVersion(CompatibilityVersion.Version_2_1);
+            }).SetCompatibilityVersion(CompatibilityVersion.Version_2_2);
 
 
-            //Register event handlers via reflection
+            // Register event handlers via reflection
             services.RegisterAssembliesEventHandlers(typeof(Startup));
 
             services.AddApplicationInsightsTelemetry();
             services.AddApplicationInsightsExtensions(Configuration);
 
 
-            //https://github.com/aspnet/HttpAbstractions/issues/315
-            //Changing the default html encoding options, to not encode non-Latin characters
+            // https://github.com/aspnet/HttpAbstractions/issues/315
+            // Changing the default html encoding options, to not encode non-Latin characters
             services.Configure<WebEncoderOptions>(options => options.TextEncoderSettings = new TextEncoderSettings(UnicodeRanges.All));
 
             services.Configure<HstsOptions>(options =>
@@ -318,13 +357,7 @@ namespace VirtoCommerce.Storefront
                 c.ParameterFilter<EnumDefaultValueParameterFilter>();
 
                 // To avoid errors with repeating type names
-                // Also need to replace some symbols for RFC3986-compliance: https://github.com/domaindrivendev/Swashbuckle.AspNetCore/issues/752
-                c.CustomSchemaIds((type) => type.ToString()
-                    .Replace("[", "_")
-                    .Replace("]", "_")
-                    .Replace(",", "-")
-                    .Replace("`", "_")
-                );
+                c.CustomSchemaIds(type => (Attribute.GetCustomAttribute(type, typeof(SwaggerSchemaIdAttribute)) as SwaggerSchemaIdAttribute)?.Id ?? type.FriendlyId());
             });
 
             services.AddResponseCompression();
@@ -343,7 +376,7 @@ namespace VirtoCommerce.Storefront
                 app.UseExceptionHandler("/error/500");
                 app.UseHsts();
             }
-            //Do not write telemetry to debug output 
+            // Do not write telemetry to debug output 
             TelemetryDebugWriter.IsTracingDisabled = true;
 
             app.UseResponseCaching();
@@ -354,21 +387,34 @@ namespace VirtoCommerce.Storefront
             app.UseCookiePolicy();
 
             app.UseAuthentication();
-            //WorkContextBuildMiddleware must  always be registered first in  the Middleware chain
+            // WorkContextBuildMiddleware must  always be registered first in  the Middleware chain
             app.UseMiddleware<WorkContextBuildMiddleware>();
             app.UseMiddleware<StoreMaintenanceMiddleware>();
             app.UseMiddleware<NoLiquidThemeMiddleware>();
             app.UseMiddleware<CreateStorefrontRolesMiddleware>();
             app.UseMiddleware<ApiErrorHandlingMiddleware>();
 
+            var mvcJsonOptions = app.ApplicationServices.GetService<IOptions<MvcJsonOptions>>().Value;
+            mvcJsonOptions.SerializerSettings.Converters.Add(new CartTypesJsonConverter(app.ApplicationServices.GetService<IWorkContextAccessor>()));
+            mvcJsonOptions.SerializerSettings.Converters.Add(new MoneyJsonConverter(app.ApplicationServices.GetService<IWorkContextAccessor>()));
+            mvcJsonOptions.SerializerSettings.Converters.Add(new CurrencyJsonConverter(app.ApplicationServices.GetService<IWorkContextAccessor>()));
+            mvcJsonOptions.SerializerSettings.Converters.Add(new OrderTypesJsonConverter(app.ApplicationServices.GetService<IWorkContextAccessor>()));
+            mvcJsonOptions.SerializerSettings.Converters.Add(new RecommendationJsonConverter(app.ApplicationServices.GetService<IRecommendationProviderFactory>()));
 
-            app.UseStatusCodePagesWithReExecute("/error/{0}");
+            var mvcViewOptions = app.ApplicationServices.GetService<IOptions<MvcViewOptions>>().Value;
+            mvcViewOptions.ViewEngines.Add(app.ApplicationServices.GetService<ILiquidViewEngine>());
+
+            // Do not use status code pages for Api requests
+            app.UseWhen(context => !context.Request.Path.IsApi(), appBuilder =>
+            {
+                appBuilder.UseStatusCodePagesWithReExecute("/error/{0}");
+            });
 
             // Enable middleware to serve generated Swagger as a JSON endpoint.
             app.UseSwagger(c => c.RouteTemplate = "docs/{documentName}/docs.json");
 
             var rewriteOptions = new RewriteOptions();
-            //Load IIS url rewrite rules from external file
+            // Load IIS url rewrite rules from external file
             if (File.Exists("IISUrlRewrite.xml"))
             {
                 using (var iisUrlRewriteStreamReader = File.OpenText("IISUrlRewrite.xml"))
@@ -376,6 +422,7 @@ namespace VirtoCommerce.Storefront
                     rewriteOptions.AddIISUrlRewrite(iisUrlRewriteStreamReader);
                 }
             }
+
             rewriteOptions.Add(new StorefrontUrlNormalizeRule());
 
             var requireHttpsOptions = new RequireHttpsOptions();
@@ -385,7 +432,7 @@ namespace VirtoCommerce.Storefront
                 rewriteOptions.AddRedirectToHttps(requireHttpsOptions.StatusCode, requireHttpsOptions.Port);
             }
             app.UseRewriter(rewriteOptions);
-            //Enable browser XSS protection
+            // Enable browser XSS protection
             app.Use(async (context, next) =>
             {
                 context.Response.Headers["X-Xss-Protection"] = "1";

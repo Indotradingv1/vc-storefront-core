@@ -10,6 +10,7 @@ using VirtoCommerce.Storefront.Model.StaticContent;
 namespace VirtoCommerce.Storefront.Controllers.Api
 {
     [StorefrontApiRoute("blog")]
+    [ResponseCache(CacheProfileName = "None")]
     public class ApiBlogController : StorefrontControllerBase
     {
         public ApiBlogController(IWorkContextAccessor workContextAccessor, IStorefrontUrlBuilder urlBuilder)
@@ -20,7 +21,7 @@ namespace VirtoCommerce.Storefront.Controllers.Api
         // POST: storefrontapi/blog/{blogName}/search
         [HttpPost("{blogName}/search")]
         [ValidateAntiForgeryToken]
-        public ActionResult<List<BlogArticle>> Search([FromQuery] string blogName, [FromBody] BlogSearchCriteria criteria)
+        public ActionResult<List<BlogArticle>> Search([FromRoute] string blogName, [FromBody] BlogSearchCriteria criteria)
         {
             var articles = new List<BlogArticle>();
 

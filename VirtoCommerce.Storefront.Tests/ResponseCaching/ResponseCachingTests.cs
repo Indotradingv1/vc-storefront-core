@@ -9,6 +9,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Net.Http.Headers;
 using Moq;
 using VirtoCommerce.LiquidThemeEngine;
+using VirtoCommerce.Storefront.Model;
+using VirtoCommerce.Storefront.Model.Common;
 using VirtoCommerce.Storefront.Model.Stores;
 using Xunit;
 using Language = VirtoCommerce.Storefront.Model.Language;
@@ -28,12 +30,16 @@ namespace VirtoCommerce.Storefront.Tests.OutputCache
                     {
                         var mockEngine = new Mock<ILiquidThemeEngine>();
                         mockEngine.Setup(x => x.ReadLocalization()).Returns(new Newtonsoft.Json.Linq.JObject());
-                        mockEngine.Setup(x => x.GetAssetStream(It.IsAny<string>())).Returns(new MemoryStream(Encoding.UTF8.GetBytes("some data")));
+                        mockEngine.Setup(x => x.GetAssetStreamAsync(It.IsAny<string>())).Returns(Task.FromResult((Stream)new MemoryStream(Encoding.UTF8.GetBytes("some data"))));
                         mockEngine.Setup(x => x.ResolveTemplatePath(It.IsIn(new[] { "index" }))).Returns("path");
                         services.AddSingleton(mockEngine.Object);
                         var mockStoreService = new Mock<IStoreService>();
                         mockStoreService.Setup(x => x.GetAllStoresAsync()).ReturnsAsync(new Store[] { new Store { Id = "Electronics", DefaultLanguage = new Language("en-US") } });
                         services.AddSingleton(mockStoreService.Object);
+
+                        var mockCurrencyService = new Mock<ICurrencyService>();
+                        mockCurrencyService.Setup(x => x.GetAllCurrenciesAsync(It.IsAny<Language>())).ReturnsAsync(new Currency[] { });
+                        services.AddSingleton(mockCurrencyService.Object);
 
                     })
                 ).CreateClient();
